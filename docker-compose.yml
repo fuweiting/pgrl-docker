@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  pgrl-q1:
+    build: .
+    container_name: pgrl-trainer-q1
+    # 每個容器都認為自己是 localhost，所以不需要 network host
+    # 也不用 expose port 5432，因為只有內部的 Python 要連
+    volumes:
+      # 掛載 Log 出來
+      - ./training_log:/app/training_log
+    
+    # 環境變數 (雖然我們已經寫死在 entrypoint，但可以在這覆蓋)
+    environment:
+      PGDATA: /var/lib/postgresql/data
+
+    # 針對 Q1 訓練
+    command: python src/test_ppo.py --queries "Q1" --dsn "dbname=tpch10 user=wettin password=Qwer1234! host=localhost port=5432" --remote-conf "/var/lib/postgresql/data/auto_tuning.conf"
+
+  # 如果你要平行訓練 Q2，只要複製一組 service
+  # pgrl-q2:
+  #   build: .
+  #   container_name: pgrl-trainer-q2
+  #   command: python src/test_ppo.py --queries "Q2" ...

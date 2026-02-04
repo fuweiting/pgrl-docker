@@ -1,0 +1,12 @@
+# Python 暫存檔
+__pycache__/
+*.pyc
+
+# 訓練紀錄 (通常不建議上傳大型 log)
+training_log/
+
+# 系統檔案 (如果是 Mac)
+.DS_Store
+
+# 環境變數 (如果有 .env 檔務必忽略，避免洩漏密碼)
+.env
