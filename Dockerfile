@@ -29,9 +29,12 @@ COPY . /app
 
 # 4. 複製啟動腳本
 COPY entrypoint.sh /usr/local/bin/
-# [修正] 使用 sed 移除 Windows 的 \r 換行符號，避免 "unexpected end of file" 錯誤
-RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && \
-    chmod +x /usr/local/bin/entrypoint.sh
+# 安裝 dos2unix 來強制轉換換行格式
+RUN apt-get update && apt-get install -y dos2unix && \
+    dos2unix /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh && \
+    # 清理 apt 快取減小容量
+    rm -rf /var/lib/apt/lists/*
 
 # 5. 設定 Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
