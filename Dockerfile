@@ -29,12 +29,7 @@ COPY . /app
 
 # 4. 複製啟動腳本
 COPY entrypoint.sh /usr/local/bin/
-# 安裝 dos2unix 來強制轉換換行格式
-RUN apt-get update && apt-get install -y dos2unix && \
-    dos2unix /usr/local/bin/entrypoint.sh && \
-    chmod +x /usr/local/bin/entrypoint.sh && \
-    # 清理 apt 快取減小容量
-    rm -rf /var/lib/apt/lists/*
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # 5. 設定 Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
