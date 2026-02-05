@@ -24,10 +24,16 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     chown -R postgres:postgres "$PG_DATA"
     su - postgres -c "/usr/lib/postgresql/15/bin/initdb -D $PG_DATA"
 
-    # 2. 修改設定檔以允許免密碼連線
+    # 2. 修改設定檔
     echo "host all all 127.0.0.1/32 trust" >> "$PG_DATA/pg_hba.conf"
     echo "local all all trust" >> "$PG_DATA/pg_hba.conf"
     echo "listen_addresses = '*'" >> "$PG_DATA/postgresql.conf"
+    
+    # [關鍵修正] 先建立空的 auto_tuning.conf，否則 DB 會因為找不到檔案而無法啟動
+    touch "$PG_DATA/auto_tuning.conf"
+    chown postgres:postgres "$PG_DATA/auto_tuning.conf"
+    
+    # 然後再告訴 Postgres 去 include 它
     echo "include = 'auto_tuning.conf'" >> "$PG_DATA/postgresql.conf"
 
     # 3. 暫時啟動資料庫
@@ -76,6 +82,12 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -m fast stop"
 else
     echo "[Init] Database already initialized. Skipping setup."
+    
+    # [保險措施] 如果資料夾存在但 auto_tuning.conf 不見了（例如被手動刪除），補回來
+    if [ ! -f "$PG_DATA/auto_tuning.conf" ]; then
+        touch "$PG_DATA/auto_tuning.conf"
+        chown postgres:postgres "$PG_DATA/auto_tuning.conf"
+    fi
 fi
 
 # --- 正式啟動階段 ---
