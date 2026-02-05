@@ -29,7 +29,9 @@ COPY . /app
 
 # 4. 複製啟動腳本
 COPY entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# [修正] 使用 sed 移除 Windows 的 \r 換行符號，避免 "unexpected end of file" 錯誤
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh
 
 # 5. 設定 Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
