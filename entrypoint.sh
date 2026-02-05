@@ -7,6 +7,24 @@ DB_NAME="tpch10"
 DB_USER="wettin"  # 你的同名帳號
 TPCH_DIR="/opt/tpch-dbgen/dbgen"
 
+# [新增] 確保資料目錄存在，如果不存在就建立並設定權限
+if [ ! -d "$PG_DATA" ]; then
+    echo "[Init] Creating data directory: $PG_DATA"
+    mkdir -p "$PG_DATA"
+    chown -R postgres:postgres "$PG_DATA"
+    chmod 700 "$PG_DATA"
+fi
+
+# 檢查資料庫是否已經初始化過 (現在目錄一定存在，ls 不會報錯)
+if [ -z "$(ls -A "$PG_DATA")" ]; then
+    echo "[Init] Data directory is empty. Starting initialization..."
+
+    # 1. 初始化 PostgreSQL 資料目錄
+    echo "[Init] Running initdb..."
+    # chown 已經在上面做過了，這裡可以省略，或保留當作雙重確認
+    chown -R postgres:postgres "$PG_DATA" 
+    su - postgres -c "/usr/lib/postgresql/15/bin/initdb -D $PG_DATA"
+
 # 檢查資料庫是否已經初始化過
 if [ -z "$(ls -A "$PG_DATA")" ]; then
     echo "[Init] Data directory is empty. Starting initialization..."
