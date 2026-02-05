@@ -19,7 +19,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /opt
 RUN git clone https://github.com/gregrahn/tpch-kit.git tpch-dbgen \
     && cd tpch-dbgen/dbgen \
-    && make
+    && make \
+    && cd /opt \
+    && git clone https://github.com/tvondra/pg_tpch.git pg_tpch
 
 # 3. 複製 Python 依賴與程式碼
 WORKDIR /app

@@ -6,8 +6,9 @@ PG_DATA="/var/lib/postgresql/data"
 DB_NAME="tpch10"
 DB_USER="wettin"
 TPCH_DIR="/opt/tpch-dbgen/dbgen"
+PG_TPCH_DIR="/opt/pg_tpch" # 新增這個變數
 
-# 確保資料目錄存在，如果不存在就建立並設定權限
+# 確保資料目錄存在
 if [ ! -d "$PG_DATA" ]; then
     echo "[Init] Creating data directory: $PG_DATA"
     mkdir -p "$PG_DATA"
@@ -29,12 +30,15 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     echo "local all all trust" >> "$PG_DATA/pg_hba.conf"
     echo "listen_addresses = '*'" >> "$PG_DATA/postgresql.conf"
     
-    # [關鍵修正] 先建立空的 auto_tuning.conf，否則 DB 會因為找不到檔案而無法啟動
+    # 建立空的 auto_tuning.conf 並 include
     touch "$PG_DATA/auto_tuning.conf"
     chown postgres:postgres "$PG_DATA/auto_tuning.conf"
-    
-    # 然後再告訴 Postgres 去 include 它
     echo "include = 'auto_tuning.conf'" >> "$PG_DATA/postgresql.conf"
+
+    # 優化寫入效能 (加速 Index 建立)
+    echo "max_wal_size = 4GB" >> "$PG_DATA/postgresql.conf"
+    echo "checkpoint_timeout = 30min" >> "$PG_DATA/postgresql.conf"
+    echo "maintenance_work_mem = 2GB" >> "$PG_DATA/postgresql.conf" # 建立 Index 需要大記憶體
 
     # 3. 暫時啟動資料庫
     echo "[Init] Starting temp DB..."
@@ -47,15 +51,12 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
 
     # 5. 建立 Table Schema
     echo "[Init] Creating Tables..."
-    # 假設 dss.ddl 在正確位置
     su - postgres -c "psql -d $DB_NAME -f $TPCH_DIR/dss.ddl"
 
     # 6. 生成資料
     echo "[Init] Generating TPC-H Data (Scale Factor 10)..."
     cd $TPCH_DIR
     ./dbgen -vf -s 10
-    
-    # 修正權限確保 Postgres 能讀
     chmod 644 $TPCH_DIR/*.tbl
 
     # 7. 匯入資料
@@ -68,6 +69,16 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
             rm "$file_path"
         fi
     done
+
+    # ----------------------------------------------------------------
+    # 8. [新增] 建立 Primary Keys 與 Indexes (使用 tvondra/pg_tpch)
+    # ----------------------------------------------------------------
+    echo "[Init] Creating Primary Keys (This takes time)..."
+    su - postgres -c "psql -d $DB_NAME -f $PG_TPCH_DIR/dss/tpch-pkeys.sql"
+
+    echo "[Init] Creating Indexes (This takes MORE time)..."
+    su - postgres -c "psql -d $DB_NAME -f $PG_TPCH_DIR/dss/tpch-index.sql"
+    # ----------------------------------------------------------------
 
     # 9. 權限設定
     echo "[Init] Granting permissions..."
@@ -82,8 +93,7 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -m fast stop"
 else
     echo "[Init] Database already initialized. Skipping setup."
-    
-    # [保險措施] 如果資料夾存在但 auto_tuning.conf 不見了（例如被手動刪除），補回來
+    # 補回 auto_tuning.conf 防呆
     if [ ! -f "$PG_DATA/auto_tuning.conf" ]; then
         touch "$PG_DATA/auto_tuning.conf"
         chown postgres:postgres "$PG_DATA/auto_tuning.conf"

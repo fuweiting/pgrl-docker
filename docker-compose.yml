@@ -6,6 +6,9 @@ services:
     container_name: pgrl-trainer-q1
     # 每個容器都認為自己是 localhost，所以不需要 network host
     # 也不用 expose port 5432，因為只有內部的 Python 要連
+
+    shm_size: 4gb
+    
     volumes:
       # 掛載 Log 出來
       - ./training_log:/app/training_log
