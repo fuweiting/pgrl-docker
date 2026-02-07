@@ -65,11 +65,6 @@ class PgConfEnv(gym.Env):
         
         self.fixed_params = fixed_params if fixed_params else {}
 
-        # SSH 檢查: Restart 模式必須有 SSH
-        # if self.tuning_mode == "restart":
-        #     if not ssh_client or not ssh_password:
-        #         raise ValueError("Restart mode requires ssh_client and ssh_password")
-
         self.ssh_client = ssh_client
         self.ssh_password = ssh_password
         self.remote_conf_path = remote_conf_path
@@ -214,14 +209,15 @@ class PgConfEnv(gym.Env):
         raise Exception(f"Failed to connect to DB mode={self.tuning_mode}")
 
     def _update_remote_config_and_restart(self, params: dict[str, str], max_retries=3):
-        """(P3 Only) 寫入設定檔並重啟"""
+        """ 
+        Write config file and restart DB.
+        Supports both SSH mode (original) and Local mode (e.g., Docker) based on whether ssh_client is provided.
+        """
         
-        # [修正] 合併固定參數 (P1/P2 Context) 與 當前嘗試參數 (P3 Action)
-        # 這樣寫入設定檔時，才會包含所有階段的設定
         full_config = self.fixed_params.copy()
         full_config.update(params)
 
-        # 使用 full_config 來產生設定檔內容
+        # Generate config content from full_config
         config_lines = [f"{k} = '{v}'" for k, v in full_config.items()]
         config_content = "\n".join(config_lines)
         
@@ -229,25 +225,23 @@ class PgConfEnv(gym.Env):
             # === Local Mode (Docker) ===
             print(f"[System] Applying config locally to {self.remote_conf_path}...")
             try:
-                # 1. 寫入設定檔
-                # 注意: Docker 內通常是以 root 或 postgres 執行，直接寫入即可
-                # 如果權限不足，可能需要切換使用者，但在 entrypoint 我們已經給了權限
+                # 1. Write config file
                 with open(self.remote_conf_path, 'w') as f:
                     f.write(config_content)
                 
-                # 確保權限正確
+                # Ensure correct permissions
                 subprocess.run(f"chown postgres:postgres {self.remote_conf_path}", shell=True, check=True)
                 
-                # 2. 重啟 DB
+                # 2. Restart DB
                 print("[System] Restarting Local PostgreSQL...")
-                # 切換成 postgres 使用者執行 pg_ctl restart
+                # Switch to postgres user to execute pg_ctl restart
                 cmd = "su - postgres -c '/usr/lib/postgresql/15/bin/pg_ctl -D /var/lib/postgresql/data -w restart'"
                 subprocess.run(cmd, shell=True, check=True)
                 
                 print("[System] Local PostgreSQL restarted successfully.")
                 time.sleep(2.0)
                 self._reconnect_db()
-                return # 成功就返回
+                return
 
             except Exception as e:
                 print(f"[Error] Local Restart Failed: {e}")

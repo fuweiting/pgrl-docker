@@ -380,7 +380,7 @@ def main():
 
             print("[Phase 1] Persisting configs...")
             
-            # 判斷是否需要 SSH
+            # Check if we need SSH, in Docker environment we can skip SSH and apply config directly
             if args.ssh_host and args.ssh_host not in ["", "localhost", "127.0.0.1"]:
                 print("[Phase 1] Connecting Temporary SSH...")
                 temp_ssh = create_ssh_client(args)
@@ -403,7 +403,6 @@ def main():
             except Exception as e:
                 print(f"[Error] Failed to apply P1 config: {e}")
             finally:
-                # 只有當 temp_ssh 真的存在時才關閉
                 if temp_ssh:
                     temp_ssh.close()
                     print("[Phase 1] Temporary SSH connection closed.")

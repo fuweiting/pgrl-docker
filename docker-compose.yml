@@ -7,19 +7,19 @@ services:
     shm_size: 4gb
     
     volumes:
-      # 掛載 Log
+      # Mount log directory
       - ./training_log:/app/training_log
-      # Q1 專屬資料庫資料夾
+      # Mount Q1 specific database directory
       - ./pg_data_q1:/var/lib/postgresql/data
     
     environment:
       PGDATA: /var/lib/postgresql/data
 
-    # 針對 Q1 訓練
+    # Training for Q1
     command: >
       python src/test_ppo.py 
       --queries "Q1" 
-      --dsn "dbname=tpch10 user=wettin password=Qwer1234! host=localhost port=5432" 
+      --dsn "dbname=tpch10 user=wettin password=312552029 host=localhost port=5432" 
       --remote-conf "/var/lib/postgresql/data/auto_tuning.conf"
       --total-p1 2048
       --total-p2 2048
@@ -31,19 +31,19 @@ services:
     shm_size: 4gb
     
     volumes:
-      # 掛載 Log
+      # Mount log directory
       - ./training_log:/app/training_log
-      # Q2 專屬資料庫資料夾 (與 Q1 分開)
+      # Mount Q2 specific database directory
       - ./pg_data_q2:/var/lib/postgresql/data
     
     environment:
       PGDATA: /var/lib/postgresql/data
 
-    # 針對 Q2 訓練
+    # Training for Q2
     command: >
       python src/test_ppo.py 
       --queries "Q2" 
-      --dsn "dbname=tpch10 user=wettin password=Qwer1234! host=localhost port=5432" 
+      --dsn "dbname=tpch10 user=wettin password=312552029 host=localhost port=5432" 
       --remote-conf "/var/lib/postgresql/data/auto_tuning.conf"
       --total-p1 2048
       --total-p2 2048

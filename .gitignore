@@ -10,3 +10,6 @@ training_log/
 
 # 環境變數 (如果有 .env 檔務必忽略，避免洩漏密碼)
 .env
+
+# PostgreSQL 資料目錄 (避免上傳大量資料)
+pg_data_*/

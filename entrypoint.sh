@@ -1,14 +1,14 @@
 #!/bin/bash
 set -e
 
-# 定義變數
+# Define variables
 PG_DATA="/var/lib/postgresql/data"
 DB_NAME="tpch10"
 DB_USER="wettin"
 TPCH_DIR="/opt/tpch-dbgen/dbgen"
-PG_TPCH_DIR="/opt/pg_tpch" # 新增這個變數
+PG_TPCH_DIR="/opt/pg_tpch"
 
-# 確保資料目錄存在
+# Ensure data directory exists
 if [ ! -d "$PG_DATA" ]; then
     echo "[Init] Creating data directory: $PG_DATA"
     mkdir -p "$PG_DATA"
@@ -16,50 +16,50 @@ if [ ! -d "$PG_DATA" ]; then
     chmod 700 "$PG_DATA"
 fi
 
-# 檢查資料庫是否已經初始化過
+# Check if the database has already been initialized
 if [ -z "$(ls -A "$PG_DATA")" ]; then
     echo "[Init] Data directory is empty. Starting initialization..."
 
-    # 1. 初始化 PostgreSQL 資料目錄
+    # 1. Initialize PostgreSQL data directory
     echo "[Init] Running initdb..."
     chown -R postgres:postgres "$PG_DATA"
     su - postgres -c "/usr/lib/postgresql/15/bin/initdb -D $PG_DATA"
 
-    # 2. 修改設定檔
+    # 2. Modify configuration files
     echo "host all all 127.0.0.1/32 trust" >> "$PG_DATA/pg_hba.conf"
     echo "local all all trust" >> "$PG_DATA/pg_hba.conf"
     echo "listen_addresses = '*'" >> "$PG_DATA/postgresql.conf"
     
-    # 建立空的 auto_tuning.conf 並 include
+    # Create an empty auto_tuning.conf and include it
     touch "$PG_DATA/auto_tuning.conf"
     chown postgres:postgres "$PG_DATA/auto_tuning.conf"
     echo "include = 'auto_tuning.conf'" >> "$PG_DATA/postgresql.conf"
 
-    # 優化寫入效能 (加速 Index 建立)
+    # Optimize write performance (speed up index creation)
     echo "max_wal_size = 4GB" >> "$PG_DATA/postgresql.conf"
     echo "checkpoint_timeout = 30min" >> "$PG_DATA/postgresql.conf"
-    echo "maintenance_work_mem = 2GB" >> "$PG_DATA/postgresql.conf" # 建立 Index 需要大記憶體
+    echo "maintenance_work_mem = 2GB" >> "$PG_DATA/postgresql.conf"
 
-    # 3. 暫時啟動資料庫
+    # 3. Temporarily start the database
     echo "[Init] Starting temp DB..."
     su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -w start"
 
-    # 4. 建立使用者與資料庫
+    # 4. Create User and Database
     echo "[Init] Creating User $DB_USER and Database $DB_NAME..."
     su - postgres -c "psql -c \"CREATE USER $DB_USER WITH SUPERUSER;\""
     su - postgres -c "psql -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER;\""
 
-    # 5. 建立 Table Schema
+    # 5. Create Table Schema
     echo "[Init] Creating Tables..."
     su - postgres -c "psql -d $DB_NAME -f $TPCH_DIR/dss.ddl"
 
-    # 6. 生成資料
+    # 6. Generate Data
     echo "[Init] Generating TPC-H Data (Scale Factor 10)..."
     cd $TPCH_DIR
     ./dbgen -vf -s 10
     chmod 644 $TPCH_DIR/*.tbl
 
-    # 7. 匯入資料
+    # 7. Import Data
     echo "[Init] Loading .tbl files into Database..."
     for table in customer lineitem nation orders part partsupp region supplier; do
         file_path="$TPCH_DIR/$table.tbl"
@@ -70,9 +70,7 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
         fi
     done
 
-    # ----------------------------------------------------------------
-    # 8. [新增] 建立 Primary Keys 與 Indexes (使用 tvondra/pg_tpch)
-    # ----------------------------------------------------------------
+    # 8. Create Primary Keys and Indexes (using tvondra/pg_tpch)
     echo "[Init] Creating Primary Keys (This takes time)..."
     su - postgres -c "psql -d $DB_NAME -f $PG_TPCH_DIR/dss/tpch-pkeys.sql"
 
@@ -80,36 +78,34 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     su - postgres -c "psql -d $DB_NAME -f $PG_TPCH_DIR/dss/tpch-index.sql"
     # ----------------------------------------------------------------
 
-    # 9. 權限設定
+    # 9. Grant permissions
     echo "[Init] Granting permissions..."
     su - postgres -c "psql -d $DB_NAME -c \"GRANT SELECT ON ALL TABLES IN SCHEMA public TO $DB_USER;\""
 
-    # 10. 優化資料庫
+    # 10. Optimize database
     echo "[Init] Running VACUUM ANALYZE..."
     su - postgres -c "psql -d $DB_NAME -c \"VACUUM ANALYZE;\""
 
-    # 11. 停止暫時的 DB
+    # 11. Stop temporary DB
     echo "[Init] Initialization complete. Stopping temp DB..."
     su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -m fast stop"
 else
     echo "[Init] Database already initialized. Skipping setup."
-    # 補回 auto_tuning.conf 防呆
     if [ ! -f "$PG_DATA/auto_tuning.conf" ]; then
         touch "$PG_DATA/auto_tuning.conf"
         chown postgres:postgres "$PG_DATA/auto_tuning.conf"
     fi
 fi
 
-# --- 正式啟動階段 ---
-
+# Official startup phase
 echo "[System] Starting PostgreSQL Server..."
 mkdir -p /var/log/postgresql
 chown -R postgres:postgres /var/log/postgresql
 
-# 背景啟動 DB
+# Start DB in the background
 su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -l /var/log/postgresql/server.log start"
 
-# 等待 DB Ready
+# Wait for DB Ready
 echo "[System] Waiting for DB to be ready..."
 sleep 3
 

@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PGDATA=/var/lib/postgresql/data
 
-# 1. 安裝系統依賴 + PostgreSQL 15 + 編譯工具
+# 1. Install necessary packages including PostgreSQL and development tools for dbgen
 RUN apt-get update && apt-get install -y \
     git \
     gcc \
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. [優化] 在 Build 階段就先下載並編譯好 TPC-H dbgen
+# 2. Download and compile TPC-H dbgen during the build stage
 WORKDIR /opt
 RUN git clone https://github.com/gregrahn/tpch-kit.git tpch-dbgen \
     && cd tpch-dbgen/dbgen \
@@ -23,18 +23,18 @@ RUN git clone https://github.com/gregrahn/tpch-kit.git tpch-dbgen \
     && cd /opt \
     && git clone https://github.com/tvondra/pg_tpch.git pg_tpch
 
-# 3. 複製 Python 依賴與程式碼
+# 3. Copy Python dependencies and code
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
-# 4. 複製啟動腳本
+# 4. Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 5. 設定 Entrypoint
+# 5. Set Entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-# 預設指令
+# Default command
 CMD ["python", "src/test_ppo.py"]

@@ -3,6 +3,6 @@ stable-baselines3[extra]==2.2.1     # Stable Baselines3 with extra dependencies
 psycopg2-binary==2.9.9              # PostgreSQL database adapter for Python
 paramiko==3.4.0                     # For SSH connections
 sshtunnel==0.4.0                    # For creating SSH tunnels
-numpy<2.0                             # Fundamental package for scientific computing with Python
+numpy<2.0                           # Fundamental package for scientific computing with Python
 pandas                              # Data analysis and manipulation tool
 shimmy>=1.0.0                       # Shimmy library for environment wrappers
