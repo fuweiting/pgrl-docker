@@ -205,15 +205,15 @@ class StepAnnealCB(BaseCallback):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dsn", default="dbname=tpch10 user=wettin application_name=PGRL-TRAIN@Wettin password=312552029", help="Base DSN without host/port; we will inject host=127.0.0.1 and forwarded port.")
+    ap.add_argument("--dsn", default="dbname=tpch10 user=wettin password=Qwer1234!", help="Base DSN without host/port; we will inject host=127.0.0.1 and forwarded port.")
 
-    ap.add_argument("--ssh-host", default="140.113.214.170")
+    ap.add_argument("--ssh-host", default="")
     ap.add_argument("--ssh-port", type=int, default=22)
-    ap.add_argument("--ssh-user", default="wettin")
+    ap.add_argument("--ssh-user", default="")
     ap.add_argument("--ssh-key", default=None)
-    ap.add_argument("--ssh-password", default="Qwer1234!")
-    ap.add_argument("--local-port", type=int, default=5433)
-    ap.add_argument("--remote-conf", default="/etc/postgresql/15/main/auto_tuning.conf")
+    ap.add_argument("--ssh-password", default="")
+    ap.add_argument("--local-port", type=int, default=5432)
+    ap.add_argument("--remote-conf", default="/var/lib/postgresql/data/auto_tuning.conf")
 
     ap.add_argument("--queries", default=TEST_SQL)
     ap.add_argument("--schedule", default="single", choices=["single","round_robin","random"])
@@ -586,7 +586,8 @@ def main():
                 print(f"[Warning] Cleanup restart failed: {e}")
 
             env_p3.close()
-            ssh_ctrl.close()
+            if ssh_ctrl:
+                ssh_ctrl.close()
         
         # ======================================================================
         # Final Summary
