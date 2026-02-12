@@ -40,6 +40,10 @@ if [ -z "$(ls -A "$PG_DATA")" ]; then
     echo "checkpoint_timeout = 30min" >> "$PG_DATA/postgresql.conf"
     echo "maintenance_work_mem = 2GB" >> "$PG_DATA/postgresql.conf"
 
+    # Configure parallelism settings
+    echo "max_worker_processes = 20" >> "$PG_DATA/postgresql.conf"
+    echo "max_parallel_workers = 20" >> "$PG_DATA/postgresql.conf"
+
     # 3. Temporarily start the database
     echo "[Init] Starting temp DB..."
     su - postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PG_DATA -w start"
