@@ -369,8 +369,15 @@ def main():
             
             p1_log_path = log_dir / f"{args.queries}_P1_steps{args.total_p1}.log"
             print(f"[Phase 1] Logging to {p1_log_path}")
+            
+            p1_callbacks = [
+                PPOLogger(), 
+                StepAnnealCB(args.total_p1),
+                ConvergenceStoppingCallback(patience=1024, min_delta_ratio=0.01) 
+            ]
+            
             with open(p1_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-                model_p1.learn(total_timesteps=args.total_p1, callback=[PPOLogger(), StepAnnealCB(args.total_p1)])
+                model_p1.learn(total_timesteps=args.total_p1, callback=p1_callbacks)
 
             print("[Phase 1] Analyzing Convergence...")
             p1_converged_config, p1_report_lines = extract_converged_params_from_log(p1_log_path, P1_PARAM_SPECS, last_n=20, threshold_ratio=DEFAULT_THRESHOLD)
@@ -459,7 +466,7 @@ def main():
             p2_callbacks = [
                 PPOLogger(), 
                 StepAnnealCB(args.total_p2),
-                ConvergenceStoppingCallback(patience=640, min_delta_ratio=0.01) 
+                ConvergenceStoppingCallback(patience=256, min_delta_ratio=0.01) 
             ]
             
             with open(p2_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -567,7 +574,7 @@ def main():
             p3_callbacks = [
                 PPOLogger(), 
                 StepAnnealCB(args.total_p3),
-                ConvergenceStoppingCallback(patience=320, min_delta_ratio=0.01) 
+                ConvergenceStoppingCallback(patience=128, min_delta_ratio=0.01) 
             ]
             
             with open(p3_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
