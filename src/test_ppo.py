@@ -1,5 +1,4 @@
-# test_ppo_v11.py
-# cosmos demo machine
+# test_ppo_v14.py
 # 3-Phase Hierarchical Training
 # Phase 1: Planner (Session)
 # Phase 2: JIT & GEQO (Session) 
@@ -8,6 +7,9 @@
 # Added Dynamic Parallel Degree Parameter Mapping
 # Fixed extract_converged_params_from_log() to excluded cache-influenced steps
 # Added ssh_host check for local mode
+# Modified parallel degree handling: removed virtual parameter and directly tuned max_parallel_workers_per_gather with dynamic levels
+# Added catastrophic latency early stopping in callback
+# Added pre-flight check to ensure include directive exists before starting SSH tunnel
 
 from pg_env import PgConfEnv, PPOLogger, ConvergenceStoppingCallback
 from stable_baselines3 import PPO
@@ -23,7 +25,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import Counter
 
-from tpch_queryspecs import Q_MAP
+from tpch_queryspecs import SQL_MAP
 from param_specs import P1_PARAM_SPECS, P2_PARAM_SPECS, P3_PARAM_SPECS
 
 DEFAULT_TOTAL_P1 = 2048
@@ -32,11 +34,8 @@ DEFAULT_TOTAL_P3 = 2048
 DEFAULT_THRESHOLD = 0.8
 TEST_SQL = "Q1"
 
+# This function resolves virtual parameters in the config by mapping them to their corresponding real parameters based on the provided specs.
 def resolve_virtual_params(config: dict, specs: dict) -> dict:
-    """
-    將收斂結果中的「虛擬參數」轉換回「真實 PostgreSQL 參數」。
-    例如：將 {'parallel_degree': '20'} 轉換為 {'max_parallel_workers_per_gather': '20'}
-    """
     new_config = {}
     for k, v in config.items():
         if k not in specs:
@@ -89,19 +88,20 @@ def extract_converged_params_from_log(log_path: Path, param_specs: dict, last_n:
     if len(window_data) < last_n:
         log_print(f"[Warning] Not enough steps ({len(window_data)} < {last_n}) for convergence check.")
     
-    # [修改後邏輯]
-    # 1. 先排序 latency
+    # Convergence analysis strategy:
+    # 1. Sort the latencies in the window and find the 20th percentile (P20) latency to serve as a baseline. 
+    # This helps to exclude the influence of the fastest 20% of steps, which are likely cache hits and not representative of the true execution plan performance.
     sorted_lats = sorted([d[0] for d in window_data])
     
-    # 2. 取出第 20 百分位 (P20) 的數值作為基準 (Baseline)
-    # 這能避開前 20% 極端快(Cache Hit) 的數據影響 Cutoff 計算
+    # 2. Use the P20 latency as the baseline for filtering.
+    # This means we will only consider steps that are within a certain percentage (latency_tolerance) of this baseline latency, effectively excluding those that are significantly faster (likely due to caching) and focusing on those that reflect the actual execution plan performance.
     p_index = int(len(sorted_lats) * 0.20) 
     baseline_lat = sorted_lats[p_index]
     
-    # 3. 計算 Cutoff (依然使用原本的 tolerance)
+    # 3. Calculate the cutoff latency based on the baseline and the specified tolerance. Only steps with latency less than or equal to this cutoff will be considered for convergence analysis.
     cutoff_lat = baseline_lat * (1.0 + latency_tolerance)
     
-    # 4. 過濾 (注意：這裡依然會保留那些比 baseline 更快的 Cache Hit 數據，因為它們也是有效的執行計畫)
+    # 4. Filter the steps based on the cutoff latency.
     filtered_lines = [line for lat, line in window_data if lat <= cutoff_lat]
 
     log_print(f"[Filter Stats] Baseline (P20): {baseline_lat:.2f} ms | Cutoff: {cutoff_lat:.2f} ms")
@@ -135,14 +135,11 @@ def extract_converged_params_from_log(log_path: Path, param_specs: dict, last_n:
         counts = Counter(values)
         most_common_val, frequency = counts.most_common(1)[0]
         
-        # [新增] 顯示名稱轉換邏輯
         spec = param_specs[param]
         display_name = param
         if spec.get("is_virtual", False) and "map_to" in spec:
-            # 如果是虛擬參數，顯示它對應的第一個真實參數名稱
             display_name = spec["map_to"][0]
 
-        # [修改] 使用 display_name 來列印 log
         status_msg = f"  -> {display_name}: "
         stats_msg = f"Mode={most_common_val} (count={frequency}/{effective_n})"
         
@@ -165,16 +162,66 @@ def append_to_master_log(file_path: Path, lines: list):
         print(f"[System] Failed to write to master log: {e}")
 
 def create_ssh_client(args):
-    """建立並回傳一個新的 SSH Client"""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
         args.ssh_host, port=args.ssh_port, username=args.ssh_user, 
         password=args.ssh_password, key_filename=args.ssh_key
     )
-    # 設定 Keepalive 防止短時間操作內斷線
     client.get_transport().set_keepalive(60)
     return client
+
+# Auto-inject include directive into postgresql.conf
+def ensure_include_directive(args):
+    if not args.ssh_host or args.ssh_host in ["", "localhost", "127.0.0.1"]:
+        return
+
+    print("\n[System] Checking if 'auto_tuning.conf' is included in main postgresql.conf...")
+    client = create_ssh_client(args)
+    
+    # Derive postgresql.conf path dynamically from --remote-conf
+    main_conf_dir = os.path.dirname(args.remote_conf)
+    main_conf_path = f"{main_conf_dir}/postgresql.conf"
+    target_conf_name = os.path.basename(args.remote_conf)
+    include_line = f"include = '{target_conf_name}'"
+    
+    try:
+        # Check if the uncommented include line already exists
+        check_cmd = f"sudo -S grep -q \"^{include_line}\" {main_conf_path}"
+        stdin, stdout, stderr = client.exec_command(check_cmd)
+        stdin.write(args.ssh_password + '\n')
+        stdin.flush()
+        
+        if stdout.channel.recv_exit_status() == 0:
+            print(f"      -> Include directive already present in {main_conf_path}.")
+        else:
+            print(f"      -> Include directive missing. Adding to {main_conf_path}...")
+            
+            # Append the line and restart
+            append_cmd = f"echo \"{include_line}\" | sudo -S tee -a {main_conf_path} > /dev/null"
+            stdin, stdout, stderr = client.exec_command(append_cmd)
+            stdin.write(args.ssh_password + '\n')
+            stdin.flush()
+            
+            if stdout.channel.recv_exit_status() == 0:
+                print("      -> Successfully appended. Restarting PostgreSQL to apply changes...")
+                restart_cmd = "sudo -S systemctl restart postgresql"
+                stdin, stdout, stderr = client.exec_command(restart_cmd)
+                stdin.write(args.ssh_password + '\n')
+                stdin.flush()
+                
+                if stdout.channel.recv_exit_status() == 0:
+                    print("      -> PostgreSQL restarted successfully.")
+                    time.sleep(5)  # Buffer to let the DB recover completely
+                else:
+                    print(f"      [Error] Failed to restart DB: {stderr.read().decode()}")
+            else:
+                print(f"      [Error] Failed to append include directive: {stderr.read().decode()}")
+                
+    except Exception as e:
+        print(f"      [Error] SSH execution failed during include check: {e}")
+    finally:
+        client.close()
 
 class StepAnnealCB(BaseCallback):
     def __init__(self, total, mid=0.5, late=0.8, ent_mid=1e-3, ent_late=0, lr_mid=3e-4, lr_late=3e-4):
@@ -205,15 +252,37 @@ class StepAnnealCB(BaseCallback):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dsn", default="dbname=tpch10 user=wettin password=Qwer1234!", help="Base DSN without host/port; we will inject host=127.0.0.1 and forwarded port.")
+    ap.add_argument(
+        "--dsn",
+        default=os.getenv("PGRL_DSN", ""),
+        help=(
+            "Base DSN without the SSH-forwarded host/port. Database name, user, "
+            "and password may also be supplied through PGDATABASE, PGUSER, and "
+            "PGPASSWORD."
+        ),
+    )
 
-    ap.add_argument("--ssh-host", default="")
-    ap.add_argument("--ssh-port", type=int, default=22)
-    ap.add_argument("--ssh-user", default="")
-    ap.add_argument("--ssh-key", default=None)
-    ap.add_argument("--ssh-password", default="")
-    ap.add_argument("--local-port", type=int, default=5432)
-    ap.add_argument("--remote-conf", default="/var/lib/postgresql/data/auto_tuning.conf")
+    ap.add_argument("--ssh-host", default=os.getenv("TARGET_SSH_HOST", ""))
+    ap.add_argument("--ssh-port", type=int, default=int(os.getenv("TARGET_SSH_PORT", "22")))
+    ap.add_argument("--ssh-user", default=os.getenv("TARGET_SSH_USER", ""))
+    ap.add_argument("--ssh-key", default=os.getenv("TARGET_SSH_KEY") or None)
+    ap.add_argument("--ssh-password", default=os.getenv("TARGET_SSH_PASS", ""))
+
+    ap.add_argument("--local-port", type=int, default=int(os.getenv("LOCAL_FORWARD_PORT", "5433")))
+    ap.add_argument(
+        "--remote-db-port",
+        type=int,
+        default=int(os.getenv("TARGET_DB_PORT", "5432")),
+        help="PostgreSQL port on the remote server.",
+    )
+    ap.add_argument(
+        "--remote-conf",
+        default=os.getenv(
+            "REMOTE_CONF_PATH",
+            os.path.join(os.getenv("PGDATA", "/var/lib/pgsql/data"), "auto_tuning.conf"),
+        ),
+        help="Remote auto_tuning.conf path used by all pipeline stages.",
+    )
 
     ap.add_argument("--queries", default=TEST_SQL)
     ap.add_argument("--schedule", default="single", choices=["single","round_robin","random"])
@@ -227,14 +296,20 @@ def main():
     ap.add_argument("--min-timeout-ms", type=int, default=3000)
     ap.add_argument("--timeout-penalty", type=float, default=-100.0)
     
+    ap.add_argument("--report-dir", default="./training_log/experiment_reports", help="Directory to save the final summary report for GCM")
+    
     args = ap.parse_args()
     
     ssh_ctrl = None
     forwarder = None
     
-    qs = [Q_MAP[name.strip()] for name in args.queries.split(',') if name.strip()]
+    qs = [SQL_MAP[name.strip()] for name in args.queries.split(',') if name.strip()]
 
-    # 1. 啟動 SSH Tunnel (必須常駐，因為 P1/P2/P3 訓練都需要它來傳送 SQL)
+    # Pre-Flight Check: Ensure include directive exists before starting tunnel
+    ensure_include_directive(args)
+    
+    # Launch SSH Tunnel if needed, and construct the forwarded DSN for database connections. 
+    # This allows the script to connect to a remote PostgreSQL instance securely, while still treating it as if it were local.
     if args.ssh_host and args.ssh_host not in ["", "localhost", "127.0.0.1"]:
         print(f"[System] Starting SSH Tunnel to {args.ssh_host}...")
         forwarder = SSHTunnelForwarder(
@@ -242,7 +317,7 @@ def main():
             ssh_username=args.ssh_user,
             ssh_password=args.ssh_password,
             ssh_pkey=args.ssh_key,
-            remote_bind_address=("127.0.0.1", 5432),
+            remote_bind_address=("127.0.0.1", args.remote_db_port),
             local_bind_address=("127.0.0.1", args.local_port),
             set_keepalive=30.0,
         )
@@ -255,12 +330,12 @@ def main():
     else:
         print("[System] Running in Local Mode (No SSH Tunnel).")
         forwarder = None
-        # 直接使用傳入的 DSN，或者預設連線到 Docker 內部的 DB
-        # 如果是 Docker 內部互連，通常 host=localhost 即可 (因為 Python 和 DB 在同一個容器)
+        # Use the provided DSN directly, but ensure it has a reasonable connect_timeout and sslmode disabled for local connections.
+        # This allows the script to be flexible and run in environments where SSH tunneling is not necessary, such as when the database is running locally or on the same network.
         forwarded_dsn = f"{args.dsn} connect_timeout=10 sslmode=disable"
     
     # ======================================================================
-    # [Dynamic Param] Auto-configure parallel_degree
+    # [Dynamic Param] Auto-configure max_parallel_workers_per_gather
     # ======================================================================
     print(f"\n[System] Detecting environment limits from DB...")
     try:
@@ -272,7 +347,7 @@ def main():
         temp_conn.close()
         print(f"[System] Detected 'max_parallel_workers' = {db_max_workers}")
         
-        # Generate dynamic levels for parallel_degree
+        # Generate dynamic levels
         target_steps = 6 
         if db_max_workers < target_steps:
             dynamic_levels = list(range(db_max_workers + 1))
@@ -283,22 +358,17 @@ def main():
                 dynamic_levels.append(db_max_workers)
             dynamic_levels = sorted(list(set(dynamic_levels)))
 
-        print(f"[System] Configured 'parallel_degree' levels: {dynamic_levels}")
+        print(f"[System] Configured 'max_parallel_workers_per_gather' levels: {dynamic_levels}")
 
-        if "max_parallel_workers_per_gather" in P1_PARAM_SPECS:
-            del P1_PARAM_SPECS["max_parallel_workers_per_gather"]
-            print("[System] Removed raw 'max_parallel_workers_per_gather' from action space.")
-
-        # Inject dynamic virtual parameter spec, mapping to max_parallel_workers_per_gather
-        P1_PARAM_SPECS["parallel_degree"] = {
-            "is_virtual": True,
-            "map_to": ["max_parallel_workers_per_gather"],
+        P1_PARAM_SPECS["max_parallel_workers_per_gather"] = {
             "min": 0,
-            "max": len(dynamic_levels) - 1, 
-            "fmt": lambda x, levels=dynamic_levels: levels[int(round(x))],
+            "max": len(dynamic_levels) - 1,
+            "fmt": lambda x, levels=dynamic_levels: f"{levels[int(round(x))]}",
             "cast": int,
+            "levels": dynamic_levels,
+            "levels_unit": "native",
         }
-        print("[System] Injected dynamic 'parallel_degree' into P1_PARAM_SPECS.")
+        print("[System] Injected dynamic levels into 'max_parallel_workers_per_gather'.")
 
     except Exception as e:
         print(f"[Warning] Failed to auto-detect limits: {e}")
@@ -309,7 +379,10 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = Path(f"training_log/{sanitized_query_name}/{timestamp}")
     log_dir.mkdir(parents=True, exist_ok=True)
-    report_log = log_dir / f"{sanitized_query_name}_experiment_report.log"
+    
+    report_dir = Path(args.report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_log = report_dir / f"{sanitized_query_name}_experiment_report.log"
     
     header_info = [
         "="*60,
@@ -325,6 +398,9 @@ def main():
         p1_converged_config = {}
         p2_converged_config = {}
         p3_converged_config = {}
+        p1_best_latency = None
+        p2_best_latency = None
+        p3_best_latency = None
 
         # ======================================================================
         # Phase 1: Planner (Session)
@@ -369,25 +445,32 @@ def main():
             
             p1_log_path = log_dir / f"{args.queries}_P1_steps{args.total_p1}.log"
             print(f"[Phase 1] Logging to {p1_log_path}")
-            
-            p1_callbacks = [
-                PPOLogger(), 
-                StepAnnealCB(args.total_p1),
-                ConvergenceStoppingCallback(patience=1024, min_delta_ratio=0.01) 
-            ]
-            
             with open(p1_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
-                model_p1.learn(total_timesteps=args.total_p1, callback=p1_callbacks)
+                model_p1.learn(total_timesteps=args.total_p1, callback=[PPOLogger(), StepAnnealCB(args.total_p1)])
 
             print("[Phase 1] Analyzing Convergence...")
             p1_converged_config, p1_report_lines = extract_converged_params_from_log(p1_log_path, P1_PARAM_SPECS, last_n=20, threshold_ratio=DEFAULT_THRESHOLD)
             append_to_master_log(report_log, ["[Phase 1 Analysis Result]"] + p1_report_lines)
             
-            p1_real_config = resolve_virtual_params(p1_converged_config, P1_PARAM_SPECS)
+            # Retrieve the best latency from the environment after training, which will be used as baseline for P2's catastrophic stopping
+            p1_best_latency = env_p1.best_latency_ms 
+            p1_baseline_latency = env_p1.latency_baseline_ms
+            print(f"[Phase 1] Baseline Latency: {p1_baseline_latency:.2f} ms")
+            print(f"[Phase 1] Best Latency Achieved: {p1_best_latency:.2f} ms")
+            
+            if p1_baseline_latency > 0 and p1_best_latency:
+                p1_improvement = (p1_baseline_latency - p1_best_latency) / p1_baseline_latency
+                print(f"[Phase 1] Latency Improvement: {p1_improvement*100:.2f}%")
+                
+                # If the improvement is less than or equal to 2%, we consider it negligible and discard the converged parameters to prevent overfitting to GCM noise. 
+                # This is a safeguard to ensure that we only apply changes that have a meaningful impact on performance.
+                if p1_improvement <= 0.02: 
+                    print("[Phase 1] [Warning] Improvement is negligible. Discarding converged parameters to prevent GCM noise.")
+                    p1_converged_config = {}
+                    append_to_master_log(report_log, [f"[Phase 1 Validation] Negligible improvement ({p1_improvement*100:.2f}% <= 2%). Parameters discarded."])
 
             print("[Phase 1] Persisting configs...")
             
-            # Check if we need SSH, in Docker environment we can skip SSH and apply config directly
             if args.ssh_host and args.ssh_host not in ["", "localhost", "127.0.0.1"]:
                 print("[Phase 1] Connecting Temporary SSH...")
                 temp_ssh = create_ssh_client(args)
@@ -399,10 +482,8 @@ def main():
                 env_p1.ssh_client = temp_ssh
                 
                 if p1_converged_config:
-                    print(f"[Phase 1] Identified converged params (Virtual): {p1_converged_config}")
-                    print(f"[Phase 1] Resolving to Real Params: {p1_real_config}")
                     print("[Phase 1] Applying Converged Config to DB...")
-                    env_p1._update_remote_config_and_restart(p1_real_config)
+                    env_p1._update_remote_config_and_restart(p1_converged_config)
                     print("[Phase 1] DB Restarted. Environment is ready for Phase 2.")
                 else:
                     print("[Warning] No parameters converged in Phase 1! Reverting to full defaults.")
@@ -416,7 +497,7 @@ def main():
             
             env_p1.close()
         
-        p1_p2_merged_params = p1_real_config.copy()
+        p1_p2_merged_params = p1_converged_config.copy()
 
         # ======================================================================
         # Phase 2: JIT & GEQO (Session)
@@ -442,7 +523,8 @@ def main():
                 early_stop_factor=args.early_stop_factor,
                 min_timeout_ms=args.min_timeout_ms,
                 timeout_penalty=args.timeout_penalty,
-                fixed_params={}
+                fixed_params={},
+                initial_baseline_ms=p1_best_latency
             )
             
             if args.total_p2 < 64:
@@ -466,7 +548,7 @@ def main():
             p2_callbacks = [
                 PPOLogger(), 
                 StepAnnealCB(args.total_p2),
-                ConvergenceStoppingCallback(patience=256, min_delta_ratio=0.01) 
+                ConvergenceStoppingCallback(patience=640, min_delta_ratio=0.01, catastrophic_patience=20)
             ]
             
             with open(p2_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -475,6 +557,21 @@ def main():
             print("[Phase 2] Analyzing Convergence...")
             p2_converged_config, p2_report_lines = extract_converged_params_from_log(p2_log_path, P2_PARAM_SPECS, last_n=20, threshold_ratio=DEFAULT_THRESHOLD)
             append_to_master_log(report_log, ["[Phase 2 Analysis Result]"] + p2_report_lines)
+            
+            # Retrieve the best latency from the environment after training, which will be used as baseline for P2's catastrophic stopping
+            p2_best_latency = env_p2.best_latency_ms 
+            p2_baseline_latency = env_p2.latency_baseline_ms
+            print(f"[Phase 2] Baseline Latency (from P1): {p2_baseline_latency:.2f} ms")
+            print(f"[Phase 2] Best Latency Achieved: {p2_best_latency:.2f} ms")
+            
+            if p2_baseline_latency > 0 and p2_best_latency:
+                p2_improvement = (p2_baseline_latency - p2_best_latency) / p2_baseline_latency
+                print(f"[Phase 2] Latency Improvement: {p2_improvement*100:.2f}%")
+                
+                if p2_improvement <= 0.02:
+                    print("[Phase 2] [Warning] Improvement is negligible. Discarding converged parameters to prevent GCM noise.")
+                    p2_converged_config = {}
+                    append_to_master_log(report_log, [f"[Phase 2 Validation] Negligible improvement ({p2_improvement*100:.2f}% <= 2%). Parameters discarded."])
             
             if p2_converged_config:
                 print(f"[Phase 2] Identified {len(p2_converged_config)} converged params: {p2_converged_config}")
@@ -501,7 +598,7 @@ def main():
                 print("[System] Establishing persistent SSH connection for Phase 3...")
                 ssh_ctrl = create_ssh_client(args) 
                 
-                # [Health Check] 確保 P3 開始前 DB 是活著的
+                # Before starting Phase 3, ensure that the remote PostgreSQL is active and can be restarted via SSH commands.
                 print("[System] Verifying remote PostgreSQL status before Phase 3...")
                 db_ready = False
                 for attempt in range(10): 
@@ -534,6 +631,8 @@ def main():
                 print("[System] Running Phase 3 in Local Mode (No SSH). Skipping SSH check.")
                 ssh_ctrl = None
                 
+            phase3_initial_baseline = p2_best_latency if p2_best_latency is not None else p1_best_latency
+
             env_p3 = PgConfEnv(
                 dsn=forwarded_dsn,
                 ssh_client=ssh_ctrl,
@@ -550,7 +649,8 @@ def main():
                 early_stop_factor=args.early_stop_factor,
                 min_timeout_ms=args.min_timeout_ms,
                 timeout_penalty=args.timeout_penalty,
-                fixed_params=p1_p2_merged_params
+                fixed_params=p1_p2_merged_params,
+                initial_baseline_ms=phase3_initial_baseline
             )
             
             if args.total_p3 < 64:
@@ -574,7 +674,7 @@ def main():
             p3_callbacks = [
                 PPOLogger(), 
                 StepAnnealCB(args.total_p3),
-                ConvergenceStoppingCallback(patience=128, min_delta_ratio=0.01) 
+                ConvergenceStoppingCallback(patience=320, min_delta_ratio=0.01, catastrophic_patience=20) 
             ]
             
             with open(p3_log_path, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -584,7 +684,21 @@ def main():
             p3_converged_config, p3_report_lines = extract_converged_params_from_log(p3_log_path, P3_PARAM_SPECS, last_n=20, threshold_ratio=DEFAULT_THRESHOLD)
             append_to_master_log(report_log, ["[Phase 3 Analysis Result]"] + p3_report_lines)
             
-            print("[System] Training finished. Resetting remote config to DEFAULTS for cleanup...")
+            p3_best_latency = env_p3.best_latency_ms
+            p3_baseline_latency = env_p3.latency_baseline_ms
+            print(f"[Phase 3] Baseline Latency (from previous phase/current baseline): {p3_baseline_latency:.2f} ms")
+            print(f"[Phase 3] Best Latency Achieved: {p3_best_latency:.2f} ms")
+            
+            if p3_baseline_latency > 0 and p3_best_latency:
+                p3_improvement = (p3_baseline_latency - p3_best_latency) / p3_baseline_latency
+                print(f"[Phase 3] Latency Improvement: {p3_improvement*100:.2f}%")
+                
+                if p3_improvement <= 0.02:
+                    print("[Phase 3] [Warning] Improvement is negligible. Discarding converged parameters to prevent GCM noise.")
+                    p3_converged_config = {}
+                    append_to_master_log(report_log, [f"[Phase 3 Validation] Negligible improvement ({p3_improvement*100:.2f}% <= 2%). Parameters discarded."])
+            
+            print("[System] Training finished. Resetting tuning config to DEFAULTS for cleanup...")
             try:
                 env_p3.fixed_params = {}
                 env_p3._update_remote_config_and_restart({}) 
@@ -594,6 +708,7 @@ def main():
             env_p3.close()
             if ssh_ctrl:
                 ssh_ctrl.close()
+                ssh_ctrl = None
         
         # ======================================================================
         # Final Summary
@@ -609,11 +724,9 @@ def main():
         # Helper to format lines
         def add_rows(specs, data, phase_label):
             for param in specs.keys():
-                # [新增] 檢查是否為虛擬參數，如果是，取出它對應的真實名稱
                 spec = specs[param]
                 display_name = param
                 if spec.get("is_virtual", False) and "map_to" in spec:
-                    # 取出 map_to 列表中的第一個真實參數名稱 (例如 max_parallel_workers_per_gather)
                     display_name = spec["map_to"][0]
 
                 if param in data:
@@ -628,7 +741,6 @@ def main():
                     status = "UNSTABLE" if is_active else "SKIP"
                     val = "N/A"
                 
-                # [修改] 這裡使用 display_name 來列印
                 summary_lines.append(f"{display_name:<30} | {phase_label:<5} | {status:<10} | {val}")
 
         add_rows(P1_PARAM_SPECS, p1_converged_config, "P1")
@@ -641,10 +753,9 @@ def main():
         print(f"[System] All logs saved to: {log_dir}")
 
     finally:
-        # 確保例外發生時，如果是 P3 階段建立的 ssh_ctrl 能被關閉
         if ssh_ctrl: ssh_ctrl.close()
         
-        if args.ssh_host and args.ssh_host not in ["", "localhost", "127.0.0.1"]:
+        if forwarder and forwarder.is_active:
             forwarder.stop()
 
 if __name__ == "__main__":

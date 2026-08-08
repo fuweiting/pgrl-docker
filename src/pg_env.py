@@ -1,8 +1,10 @@
-# pg_env_v14_hierarchical.py
+# pg_env_v16.py
 # P1 and P2 Session/SET, P3 Restart hybrid environment
 # Added Convergence Stopping Mechanism for P2/P3 phases
 # Fixed Trust-Region Logic Bugs and Probe Handling of Boolean Parameters
 # Added Support for Local Mode without SSH (e.g., Docker)
+# Added catastrophic latency early stopping in callback
+# v16: Modified latency measurement to use EXPLAIN ANALYZE with JSON output for more accurate timing and cost information, and to avoid issues with connection resets during long-running queries.
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -11,11 +13,13 @@ import time
 import numpy as np
 import paramiko
 import subprocess
+import os
+import glob
+import shlex
 from typing import Sequence, Mapping
 from stable_baselines3.common.callbacks import BaseCallback
 from copy import deepcopy
 
-# 預設載入全部，但建議由外部傳入 P1_PARAM_SPECS 或 P2_PARAM_SPECS
 from param_specs import PARAM_SPECS as DEFAULT_PARAM_SPECS
 
 class PgConfEnv(gym.Env):
@@ -24,12 +28,12 @@ class PgConfEnv(gym.Env):
 
     def __init__(self,
                 dsn: str,
-                # --- SSH 相關 (P1 必須，P2 可選但建議保留以防萬一要 reset config) ---
+                # --- SSH ---
                 ssh_client: paramiko.SSHClient = None,       
                 ssh_password: str = None,                    
-                remote_conf_path: str = "/var/lib/pgsql/data/auto_tuning.conf",
+                remote_conf_path: str | None = None,
                 
-                # --- 環境設定 ---
+                # --- Env Config ---
                 tuning_mode: str = "restart",  # "restart" or "session"
                 tune_params=("work_mem",),
                 workload=None,
@@ -55,7 +59,8 @@ class PgConfEnv(gym.Env):
                 topk_k: int = 5,
                 
                 # --- P1 converged params ---
-                fixed_params: dict = None
+                fixed_params: dict = None,
+                initial_baseline_ms: float = None   # Phase 2 and Phase 3 can use this to set an initial latency baseline from Phase 1 results
                 ):
         super().__init__()
         self.dsn = dsn
@@ -67,20 +72,20 @@ class PgConfEnv(gym.Env):
 
         self.ssh_client = ssh_client
         self.ssh_password = ssh_password
-        self.remote_conf_path = remote_conf_path
+        default_conf_path = os.path.join(os.getenv("PGDATA", "/var/lib/pgsql/data"), "auto_tuning.conf")
+        self.remote_conf_path = remote_conf_path or os.getenv("REMOTE_CONF_PATH", default_conf_path)
         
-        # 連線物件
         self.conn = None
         self._reconnect_db()
 
         self.start_from_default = bool(start_from_default)
         self.baseline_first_step = bool(baseline_first_step)
-        self.did_global_baseline = False
+        self.latency_baseline_ms = float(initial_baseline_ms) if initial_baseline_ms is not None else None
+        self.did_global_baseline = (initial_baseline_ms is not None)
         
         self.early_stop_factor = early_stop_factor
         self.min_timeout_ms = int(min_timeout_ms)
         self.timeout_penalty = float(timeout_penalty)
-        self.latency_baseline_ms = None
         self.trim_mode = trim_mode
 
         self.param_specs = dict(DEFAULT_PARAM_SPECS) if param_specs is None else dict(param_specs)
@@ -89,7 +94,7 @@ class PgConfEnv(gym.Env):
         for p in self.tune_params:
             assert p in self.param_specs, f"unknown param {p}"
         
-        # P2 模式專用：儲存當前的 session 參數 (key: value_str)
+        # P2 Session Parameters Dictionary
         self.current_session_params = {}
 
         # Trust-Region Control
@@ -134,68 +139,109 @@ class PgConfEnv(gym.Env):
         self._pick_active_query(first_time=True)
 
     # ---------- Connection & Config Helpers ----------
-      
+    def _local_pgdata(self) -> str:
+        """Return the local PostgreSQL data directory used by Docker/local mode."""
+        return os.getenv("PGDATA") or os.path.dirname(self.remote_conf_path)
+
+    def _local_pg_ctl(self) -> str:
+        """Resolve pg_ctl without hard-coding a PostgreSQL major version."""
+        explicit = os.getenv("PG_CTL_PATH")
+        if explicit:
+            return explicit
+
+        candidates = glob.glob("/usr/lib/postgresql/*/bin/pg_ctl")
+        if candidates:
+            def version_key(path: str):
+                version = path.split("/postgresql/", 1)[1].split("/", 1)[0]
+                try:
+                    return tuple(int(part) for part in version.split("."))
+                except ValueError:
+                    return (0,)
+            return max(candidates, key=version_key)
+
+        return "pg_ctl"
+
+    def _write_local_config(self, config_content: str):
+        os.makedirs(os.path.dirname(self.remote_conf_path), exist_ok=True)
+        with open(self.remote_conf_path, "w", encoding="utf-8") as f:
+            f.write(config_content)
+        subprocess.run(["chown", "postgres:postgres", self.remote_conf_path], check=True)
+        subprocess.run(["chmod", "644", self.remote_conf_path], check=True)
+
+    def _run_local_pg_ctl(self, action: str):
+        pg_ctl = self._local_pg_ctl()
+        pgdata = self._local_pgdata()
+        wait_opt = " -w" if action in {"start", "stop", "restart"} else ""
+        command = f"{shlex.quote(pg_ctl)} -D {shlex.quote(pgdata)}{wait_opt} {shlex.quote(action)}"
+        subprocess.run(["su", "-", "postgres", "-c", command], check=True)
+
     def _update_remote_config_and_reload(self, params: dict[str, str]):
-        """Combine P1 fixed (converged) params with current params, write config file, and reload (P2 Only)"""
-        
-        # 1. Combine params
+        """Apply config and reload PostgreSQL in either local or SSH mode."""
         combined_params = self.fixed_params.copy()
         combined_params.update(params)
 
         config_lines = [f"{k} = '{v}'" for k, v in combined_params.items()]
         config_content = "\n".join(config_lines)
+
+        if self.ssh_client is None:
+            try:
+                print(f"[System] Applying config locally to {self.remote_conf_path}...")
+                self._write_local_config(config_content)
+                print("[System] Reloading Local PostgreSQL...")
+                self._run_local_pg_ctl("reload")
+                time.sleep(0.5)
+                self._reconnect_db()
+                return
+            except Exception as e:
+                print(f"[Error] Local Config Reload Failed: {e}")
+                raise
+
         temp_path = "/tmp/auto_tuning.tmp"
-        
         try:
-            # 2. SFTP upload to temp file
             sftp = self.ssh_client.open_sftp()
-            with sftp.file(temp_path, 'w') as f:
+            with sftp.file(temp_path, "w") as f:
                 f.write(config_content)
             sftp.close()
-            
-            # 3. Move file (overwrite auto_tuning.conf)
-            mv_cmd = f"sudo -S mv -f {temp_path} {self.remote_conf_path} && sudo -S chown postgres:postgres {self.remote_conf_path} && sudo -S chmod 644 {self.remote_conf_path}"
+
+            mv_cmd = (
+                f"sudo -S mv -f {temp_path} {self.remote_conf_path} && "
+                f"sudo -S chown postgres:postgres {self.remote_conf_path} && "
+                f"sudo -S chmod 644 {self.remote_conf_path}"
+            )
             stdin, stdout, stderr = self.ssh_client.exec_command(mv_cmd, get_pty=True)
-            stdin.write(self.ssh_password + '\n')
+            stdin.write((self.ssh_password or "") + "\n")
             stdin.flush()
-            
+
             exit_code = stdout.channel.recv_exit_status()
             if exit_code != 0:
                 out_msg = stdout.read().decode().strip()
                 err_msg = stderr.read().decode().strip()
-                raise Exception(f"Failed to update config. Code: {exit_code}, STDOUT: {out_msg}, STDERR: {err_msg}")
+                raise RuntimeError(f"Failed to update config. Code: {exit_code}, STDOUT: {out_msg}, STDERR: {err_msg}")
 
-            # 4. Execute Reload command (faster than Restart)
-            reload_cmd = 'sudo -S systemctl reload postgresql'
+            reload_cmd = "sudo -S systemctl reload postgresql"
             stdin, stdout, stderr = self.ssh_client.exec_command(reload_cmd, get_pty=True)
-            stdin.write(self.ssh_password + '\n')
+            stdin.write((self.ssh_password or "") + "\n")
             stdin.flush()
-            
+
             exit_code = stdout.channel.recv_exit_status()
             if exit_code != 0:
                 out_msg = stdout.read().decode().strip()
                 err_msg = stderr.read().decode().strip()
                 raise RuntimeError(f"PostgreSQL failed to reload: {out_msg} {err_msg}")
-            
-            # 5. Wait a moment to ensure settings take effect (SIGHUP is asynchronous)
-            time.sleep(0.5) 
-            
-            # Optional: Reload usually doesn't require reconnect, but to be safe and ensure the session picks up new settings, reconnecting is more reliable
-            self._reconnect_db()
 
+            time.sleep(0.5)
+            self._reconnect_db()
         except Exception as e:
             print(f"SSH/Config Reload Error: {e}")
-            raise e
-    
+            raise
+
     def _reconnect_db(self):
-        """建立或重新建立 DB 連線"""
         if self.conn:
             try:
                 self.conn.close()
             except:
                 pass
         
-        # Session 模式通常不需要像 Restart 模式那樣 retry 這麼多次，除非網路不穩
         max_retries = 10 if self.tuning_mode == "restart" else 3
         
         for attempt in range(max_retries):
@@ -208,16 +254,11 @@ class PgConfEnv(gym.Env):
         
         raise Exception(f"Failed to connect to DB mode={self.tuning_mode}")
 
+    # Update config and restart logic for P3, with retry mechanism and better error handling
     def _update_remote_config_and_restart(self, params: dict[str, str], max_retries=3):
-        """ 
-        Write config file and restart DB.
-        Supports both SSH mode (original) and Local mode (e.g., Docker) based on whether ssh_client is provided.
-        """
-        
         full_config = self.fixed_params.copy()
         full_config.update(params)
 
-        # Generate config content from full_config
         config_lines = [f"{k} = '{v}'" for k, v in full_config.items()]
         config_content = "\n".join(config_lines)
         
@@ -225,27 +266,16 @@ class PgConfEnv(gym.Env):
             # === Local Mode (Docker) ===
             print(f"[System] Applying config locally to {self.remote_conf_path}...")
             try:
-                # 1. Write config file
-                with open(self.remote_conf_path, 'w') as f:
-                    f.write(config_content)
-                
-                # Ensure correct permissions
-                subprocess.run(f"chown postgres:postgres {self.remote_conf_path}", shell=True, check=True)
-                
-                # 2. Restart DB
+                self._write_local_config(config_content)
                 print("[System] Restarting Local PostgreSQL...")
-                # Switch to postgres user to execute pg_ctl restart
-                cmd = "su - postgres -c '/usr/lib/postgresql/15/bin/pg_ctl -D /var/lib/postgresql/data -w restart'"
-                subprocess.run(cmd, shell=True, check=True)
-                
+                self._run_local_pg_ctl("restart")
                 print("[System] Local PostgreSQL restarted successfully.")
                 time.sleep(2.0)
                 self._reconnect_db()
                 return
-
             except Exception as e:
                 print(f"[Error] Local Restart Failed: {e}")
-                raise e
+                raise
         
         else:
             # === SSH Mode (Original Logic) ===
@@ -264,12 +294,9 @@ class PgConfEnv(gym.Env):
                 exit_code = stdout.channel.recv_exit_status()
                 
                 if exit_code != 0:
-                    # [修正] 當 get_pty=True 時，錯誤訊息通常在 stdout 而不是 stderr
-                    # 我們把兩邊都讀出來，確保不會漏掉訊息
                     out_msg = stdout.read().decode().strip()
                     err_msg = stderr.read().decode().strip()
                     
-                    # 組合完整的錯誤訊息
                     raise Exception(f"Failed to update config. Code: {exit_code}, STDOUT: '{out_msg}', STDERR: '{err_msg}'")
 
                 restart_success = False
@@ -299,17 +326,14 @@ class PgConfEnv(gym.Env):
                 raise e
 
     def _apply_factory_defaults(self):
-        """Reset Logic"""
         if self.tuning_mode == "restart":
-            # P1: 清空設定檔並重啟
             self._update_remote_config_and_restart({})
         else:
-            # P2: 不動設定檔，只清空當前的 session 參數記憶，並在 DB 執行 RESET ALL
             self.current_session_params = {}
             try:
                 if self.conn and self.conn.closed == 0:
                     with self.conn.cursor() as cur:
-                        cur.execute("RESET ALL;") # 回到 Config File 的設定 (即 P1 的結果)
+                        cur.execute("RESET ALL;")
                     self.conn.commit()
             except Exception as e:
                 print(f"[Warning] Failed to RESET ALL in session mode: {e}")
@@ -326,9 +350,8 @@ class PgConfEnv(gym.Env):
             self.active = self.workload_specs[0]
         self.sql, self.sql_params = self.active.sql, self.active.params
 
-    # ---------- Helpers for TR logic (Unchanged) ---------- 
+    # ---------- Helpers for TR logic ---------- 
     def _rank_all_by_deviation(self, cur_numeric: dict) -> list[dict]:
-        # (保持原樣 ...)
         if not self.best_numeric: return []
         items = []
         for p in self.tune_params:
@@ -349,7 +372,6 @@ class PgConfEnv(gym.Env):
         return items
 
     def _fix_trust_bounds(self, p: str):
-        # (保持原樣 ...)
         spec = self.param_specs[p]
         lo = max(float(spec["min"]), min(self.trust[p]["lo"], float(spec["max"])))
         hi = max(float(spec["min"]), min(self.trust[p]["hi"], float(spec["max"])))
@@ -357,35 +379,88 @@ class PgConfEnv(gym.Env):
         self.trust[p]["lo"], self.trust[p]["hi"] = lo, hi    
     
     def _fmt_range(self, p: str) -> str:
-        # (保持原樣 ...)
         lo, hi = self.trust[p]["lo"], self.trust[p]["hi"]
         sample = self.param_specs[p]["cast"]((lo + hi) / 2.0)
         if isinstance(sample, (int, str)): return f"{int(lo)}..{int(hi)}"
         return f"{lo:.3g}..{hi:.3g}"
     
     def _is_bool_param(self, p: str) -> bool:
-        lo, hi = self.trust[p]["lo"], self.trust[p]["hi"]
-        sample = self.param_specs[p]["cast"]((lo + hi) / 2.0)
-        return isinstance(sample, str)
-    
+        spec = self.param_specs[p]
+        if spec.get("is_bool", False):
+            return True
+        # Backward-compatible detection for older spec files.
+        if spec.get("min") == 0 and spec.get("max") == 1 and callable(spec.get("fmt")):
+            try:
+                return {str(spec["fmt"](0)).lower(), str(spec["fmt"](1)).lower()} == {"off", "on"}
+            except Exception:
+                pass
+        return False
+
+    def _setting_to_mb(self, setting: str, unit: str | None) -> float:
+        value = float(setting)
+        if value == -1:
+            return -1.0
+        if not unit:
+            return value
+        if unit.endswith("kB"):
+            prefix = unit[:-2]
+            multiplier = int(prefix) if prefix.isdigit() else 1
+            return value * multiplier / 1024.0
+        if unit == "MB":
+            return value
+        if unit == "GB":
+            return value * 1024.0
+        return value
+
     def _to_numeric_from_pg(self, p: str, setting: str, unit: str | None) -> float:
-        # (保持原樣 ...)
+        """Convert pg_settings output into the same numeric domain used by PPO/TRIM.
+
+        For level-based parameters the RL domain is the level index, not the
+        physical PostgreSQL value. Keeping this representation consistent is
+        essential for b*, timeout ranking, probes, and trust-region shrinking.
+        """
+        spec = self.param_specs[p]
+        levels = spec.get("levels")
+
+        if levels:
+            try:
+                if float(setting) == -1 and -1 in levels:
+                    actual_value = -1.0
+                elif spec.get("levels_unit") == "MB":
+                    actual_value = self._setting_to_mb(setting, unit)
+                else:
+                    actual_value = float(setting)
+
+                nearest_index = min(
+                    range(len(levels)),
+                    key=lambda i: abs(float(levels[i]) - actual_value),
+                )
+                return float(nearest_index)
+            except Exception:
+                return float(spec.get("min", 0))
+
         if unit is None or unit == "":
             s = setting.strip().lower()
-            if s in ("on", "off"): return 1.0 if s == "on" else 0.0
-            try: return float(setting)
-            except: return 0.0
+            if s in ("on", "off"):
+                return 1.0 if s == "on" else 0.0
+            try:
+                return float(setting)
+            except Exception:
+                return 0.0
+
+        if str(setting).strip() == "-1":
+            return -1.0
         if unit.endswith("kB"):
-            mul = 1
-            prefix = unit[:-2]
-            if prefix.isdigit(): mul = int(prefix)
-            try: kb = float(setting) * mul; return kb / 1024.0
-            except: return 0.0
-        try: return float(setting)
-        except: return 0.0
+            try:
+                return self._setting_to_mb(setting, unit)
+            except Exception:
+                return 0.0
+        try:
+            return float(setting)
+        except Exception:
+            return 0.0
 
     def _record_trim(self, p: str, old_lo: float, old_hi: float, new_lo: float, new_hi: float, v: float, mode: str, eps: float):
-        # (保持原樣 ...)
         if (old_lo, old_hi) != (new_lo, new_hi):
             self.last_trims.append(
                 f"{p}:{mode} @{v:.3g} (−{eps:.3g}) {int(old_lo) if float(old_lo).is_integer() else old_lo:.3g}.."
@@ -395,16 +470,24 @@ class PgConfEnv(gym.Env):
             )
 
     def _fmt_num_for_log(self, p: str, x: float) -> str:
-        # (保持原樣 ...)
+        spec = self.param_specs[p]
+        if spec.get("levels"):
+            try:
+                val = spec["cast"](x)
+                formatter = spec.get("fmt", "{val}")
+                return str(formatter(val) if callable(formatter) else formatter.format(val=val))
+            except Exception:
+                pass
         lo, hi = self.trust[p]["lo"], self.trust[p]["hi"]
-        sample = self.param_specs[p]["cast"]((lo + hi) / 2.0)
+        sample = spec["cast"]((lo + hi) / 2.0)
         if isinstance(sample, (int, str)):
-            try: return str(int(round(x)))
-            except: return f"{x:.3g}"
+            try:
+                return str(int(round(x)))
+            except Exception:
+                return f"{x:.3g}"
         return f"{x:.3g}"
 
     def _schedule_probes_from_topk(self, topk: list[dict], bad_numeric: dict | None = None):
-        # (保持原樣 ...)
         self.probe_queue = []
         if not topk or not self.best_numeric: return
         for it in topk:
@@ -418,7 +501,6 @@ class PgConfEnv(gym.Env):
             })
 
     def _shrink_trust_region_on_probe_success(self, pr: dict):
-        # (保持原樣 ...)
         p = pr["param"]
         good = float(pr["probe_numeric"])
         bad  = pr.get("bad_numeric", None)
@@ -428,22 +510,13 @@ class PgConfEnv(gym.Env):
         spec = self.param_specs[p]
         sample = spec["cast"]((lo + hi) / 2.0)
         
-        # 判斷是否為「類 Boolean」參數：
-        # 1. 轉型後是字串 (舊邏輯，如 'on'/'off')
-        # 2. 或者：轉型後是 int，且範圍剛好是 0 到 1 (P1 新邏輯)
-        is_boolean_like = False
-        if isinstance(sample, str):
-            is_boolean_like = True
-        elif isinstance(sample, int) and spec.get("min") == 0 and spec.get("max") == 1:
-            is_boolean_like = True
+        is_boolean_like = self._is_bool_param(p)
 
         if is_boolean_like:
-            # 執行鎖死 (Pin) 邏輯
             self.trust[p]["lo"] = self.trust[p]["hi"] = good
             self._fix_trust_bounds(p)
             self._record_trim(p, old_lo, old_hi, self.trust[p]["lo"], self.trust[p]["hi"], good, "probe→pin", 0.0)
             return
-        # --- [修改結束] ---
         
         if bad is None:
             shrink_right = (abs(hi - good) >= abs(good - lo))
@@ -467,7 +540,6 @@ class PgConfEnv(gym.Env):
     
     def _maybe_update_bstar(self, *, timed_out: bool, lat_ms: float,
                             cur_human: dict, cur_numeric: dict, step_idx: int, query_name: str):
-        # (保持原樣 ...)
         if timed_out: return False
         if (self.best_latency_ms is None) or (lat_ms < self.best_latency_ms):
             self.best_latency_ms = float(lat_ms)
@@ -481,36 +553,36 @@ class PgConfEnv(gym.Env):
     def _execute_sql(self, timeout_ms: int | None = None):
         sql, params = self.sql, self.sql_params
         
-        # P2 關鍵修改: 在執行 SQL 前先套用 Session Parameters
-        # 這樣就不需要重啟 DB
-        
         for attempt in (1, 2):
             try:
-                t0 = time.perf_counter()
                 with self.conn.cursor() as cur:
-                    # [NEW] Apply Session Params for P2
                     if self.tuning_mode == "session" and self.current_session_params:
                         for k, v in self.current_session_params.items():
-                            # 使用 SET LOCAL 或 SET 都可以，這裡用 SET 確保在這個 transaction block 生效
-                            # 注意: v 已經是 formatted string (e.g., 'on', '1024')
                             try:
-                                cur.execute(f"SET {k} = {v}")
+                                cur.execute(f"SET {k} = '{v}'")
                             except Exception as set_e:
                                 print(f"[Warning] Failed to SET {k}={v}: {set_e}")
 
-                    # [Existing] Set Timeout
                     if timeout_ms is not None:
                         cur.execute("SET statement_timeout = %s", (int(timeout_ms),))
                     
                     try:
-                        cur.execute(sql, params)
-                        try: cur.fetchone()
-                        except: pass
-                        lat = (time.perf_counter() - t0) * 1000.0
+                        # Use EXPLAIN ANALYZE with JSON format to get detailed timing information
+                        explain_sql = "EXPLAIN (ANALYZE, FORMAT JSON) " + sql
+                        cur.execute(explain_sql, params)
+                        explain_plan = cur.fetchone()[0][0]
+                        
+                        # Extract Planning Time and Execution Time from the JSON output
+                        planning_time = explain_plan.get("Planning Time", 0.0)
+                        execution_time = explain_plan.get("Execution Time", 0.0)
+                        total_cost = explain_plan["Plan"].get("Total Cost", 0.0)
+                        
+                        # Total latency is the sum of both times
+                        lat = planning_time + execution_time
+                        
                         if timeout_ms is not None: cur.execute("SET statement_timeout = 0")
-                        return lat, False
+                        return lat, False, total_cost
                     except Exception as e:
-                        # Timeout handling ...
                         msg = str(e)
                         if "statement timeout" in msg or "canceling statement" in msg or getattr(e, "pgcode", None) == "57014":
                             try: self.conn.rollback()
@@ -518,12 +590,24 @@ class PgConfEnv(gym.Env):
                             try:
                                 with self.conn.cursor() as c2: c2.execute("SET statement_timeout = 0")
                             except: pass
+                            
                             lat = float(timeout_ms if timeout_ms is not None else self.min_timeout_ms)
                             if lat <= 0: lat = self.min_timeout_ms
-                            return lat, True
+                            
+                            # Get the cost from EXPLAIN when timeout occurs, since we won't have actual execution time. 
+                            # This can help the agent learn even from timeouts.
+                            real_timeout_cost = 1e20
+                            try:
+                                with self.conn.cursor() as c3:
+                                    c3.execute("EXPLAIN (FORMAT JSON) " + sql, params)
+                                    real_timeout_cost = c3.fetchone()[0][0]["Plan"]["Total Cost"]
+                            except Exception as explain_e:
+                                print(f"[Warning] Failed to get real cost during timeout: {explain_e}")
+                                
+                            return lat, True, real_timeout_cost
                         raise
+                    
             except psycopg2.OperationalError as e:
-                # Reconnect logic ...
                 msg = str(e)
                 if attempt == 1 and ("SSL SYSCALL" in msg or "reset by peer" in msg or "connection not open" in msg or "closed" in msg):
                     print(f"[Warning] _execute_sql found closed connection (mode={self.tuning_mode}), reconnecting...")
@@ -532,8 +616,6 @@ class PgConfEnv(gym.Env):
                 raise
 
     def _total_cost(self):
-        # 這裡也要確保 Explain 前有套用參數，所以我們可以簡單地呼叫 _execute_sql 的變體
-        # 但為了簡單，我們在這裡重複 SET 的邏輯 (或者依賴 session 狀態)
         try:
             with self.conn.cursor() as cur: cur.execute("ROLLBACK")
         except:
@@ -541,10 +623,9 @@ class PgConfEnv(gym.Env):
             except: pass
             
         with self.conn.cursor() as cur:
-            # [NEW] P2 needs params for Explain too
             if self.tuning_mode == "session" and self.current_session_params:
                 for k, v in self.current_session_params.items():
-                    cur.execute(f"SET {k} = {v}")
+                    cur.execute(f"SET {k} = '{v}'")
                     
             cur.execute("EXPLAIN (FORMAT JSON) " + self.sql, self.sql_params)
             return cur.fetchone()[0][0]["Plan"]["Total Cost"]
@@ -562,11 +643,10 @@ class PgConfEnv(gym.Env):
         self.step_cnt = 0
         self._pick_active_query()
         
-        # 這裡根據模式決定 reset 行為
+        # Decide whether to reset to factory defaults at the start of each episode
         if self.start_from_default:
             self._apply_factory_defaults()
         
-        # P2 session mode 也需要清空記憶
         if self.tuning_mode == "session":
             self.current_session_params = {}
 
@@ -620,7 +700,6 @@ class PgConfEnv(gym.Env):
                     target_params = spec.get("map_to", [])
                     
                     # Use the virtual parameter's formatter to format the value
-                    # (Assuming target parameters accept the same format, e.g., all integers)
                     formatter = spec["fmt"]
                     if callable(formatter):
                         literal = formatter(val)
@@ -688,24 +767,19 @@ class PgConfEnv(gym.Env):
             }
 
         # 3. Execute SQL
-        lat_ms, timed_out = self._execute_sql(timeout_ms=timeout_ms)
+        lat_ms, timed_out, cost = self._execute_sql(timeout_ms=timeout_ms)
         
-        # 4. Reward & Post-processing (Remain same ...)
+        # 4. Reward & Post-processing
         if timed_out:
             if self.probe_current is None:
                 self.worst_numeric = dict(self.last_numeric_vals)
                 ranked = self._rank_all_by_deviation(self.worst_numeric)
-                
-                # --- [修正開始] ---
-                # 如果第一名是 Boolean 且偏差很大，就只處理它，不要把無辜的 Numeric 拖下水
+
                 if ranked and ranked[0]["is_bool"] and abs(ranked[0]["delta"]) > 0.5:
-                    # 只取所有 Boolean 類型的參數進入 Top-K
                     topk = [it for it in ranked if it["is_bool"]]
                     print(f"[TRIM Protection] Timeout caused by Flags. Scheduling only Boolean probes.")
                 else:
-                    # 否則才正常取前 K 個 (混合 Boolean 和 Numeric)
                     topk = ranked[: self.topk_k]
-                # --- [修正結束] ---
                 
                 self.last_topk = topk
                 if topk:
@@ -723,9 +797,13 @@ class PgConfEnv(gym.Env):
                 self.latency_baseline_ms = float(lat_ms)
                 self.did_global_baseline = True
 
-        obs, cost = self._obs()
+        obs = np.array([np.log1p(cost)], dtype=np.float32)
 
-        if lat_ms / (self.latency_baseline_ms + 1e-6) > 1:
+        if self.latency_baseline_ms is None:
+            # A baseline execution can fail before a usable latency is established.
+            # Return a penalty instead of attempting arithmetic with None.
+            reward = self.timeout_penalty if timed_out else -np.log(lat_ms + 1e-6)
+        elif lat_ms / (self.latency_baseline_ms + 1e-6) > 1:
             reward = (lat_ms / (self.latency_baseline_ms + 1e-6)) * self.timeout_penalty
         else:
             reward = -np.log(lat_ms + 1e-6)
@@ -743,34 +821,31 @@ class PgConfEnv(gym.Env):
 
         cur_human, cur_numeric = {}, {}
         with self.conn.cursor() as cur:
-            # Session mode 下 pg_settings 也會反映 SET 的結果
             for p in self.tune_params:
                 spec = self.param_specs[p]
                 
-                # [關鍵修正 1]: 處理虛擬參數
+                # Handle virtual parameters
                 if spec.get("is_virtual", False):
-                    # 虛擬參數本身在 pg_settings 查不到，直接用我們剛剛算出的值
-                    # 假設 self.last_numeric_vals 已經在前面被填入了 (這很重要!)
+                    # The value of a virtual parameter is determined by the last action and stored in self.last_numeric_vals when we applied the parameters.
+                    # We need to retrieve it from there instead of querying pg_settings.
                     raw_val = self.last_numeric_vals.get(p, 0)
                     
-                    # 2. [關鍵修正] 使用 spec['cast'] 強制轉回正確型別 (float -> int)
-                    # 這樣 12.0 就會變回 12，才能被 {val:d} 格式化
+                    # Cast it to the appropriate type using the spec's cast function (defaulting to float if not specified).
                     cast_func = spec.get("cast", float)
                     val = cast_func(raw_val)
                     
-                    # 3. 格式化
+                    # Format the value
                     formatter = spec.get("fmt", "{val}")
                     if callable(formatter):
                         human_val = str(formatter(val))
                     else:
                         human_val = str(formatter.format(val=val))
                     
-                    # 4. 填入 info
+                    # Record the virtual parameter itself in the info dictionary
                     info[p] = human_val
                     cur_human[p] = human_val
-                    cur_numeric[p] = float(val) # 這裡保持 float 給 RL 比較用沒關係
+                    cur_numeric[p] = float(val)
                     
-                    # [關鍵修正 2]: 順便去查它底下的真實參數，並塞入 info
                     target_params = spec.get("map_to", [])
                     for tp in target_params:
                         cur.execute("SELECT setting, unit FROM pg_settings WHERE name = %s", (tp,))
@@ -778,11 +853,10 @@ class PgConfEnv(gym.Env):
                         if res:
                             setting, unit = res
                             human = self._humanize_setting(setting, unit)
-                            info[tp] = human # 讓真實參數出現在 Log 中
-                            # 注意：這裡不需要加進 cur_human/numeric，因為 Agent 不需要知道它們
-
+                            info[tp] = human
+                            
+                # Regular parameters are retrieved directly from pg_settings
                 else:
-                    # [Original Logic]: 一般真實參數
                     cur.execute("SELECT setting, unit FROM pg_settings WHERE name = %s", (p,))
                     res = cur.fetchone()
                     if res:
@@ -814,7 +888,8 @@ class PgConfEnv(gym.Env):
         return obs, reward, done, trunc, info
 
     def _humanize_setting(self, setting: str, unit: str | None) -> str:
-        # (保持原樣 ...)
+        setting = str(setting).strip()
+        if setting == "-1": return "-1"
         if not unit: return setting
         try:
             if unit.endswith("kB"):
@@ -857,18 +932,19 @@ class PPOLogger(BaseCallback):
         step  = self.num_timesteps
         print(f"[{step:>6}] " + ", ".join(f"{k}={v}" for k, v in info.items()), flush=True)
         return True
-    
+
+# When the environment's best latency does not improve by more than 'min_delta' for 'patience' steps, stop training.
+# Includes a 'warmup_steps' period to ignore initial "fresh start" outliers.
 class ConvergenceStoppingCallback(BaseCallback):
-    """
-    When the environment's best latency does not improve by more than 'min_delta' for 'patience' steps, stop training.
-    Includes a 'warmup_steps' period to ignore initial "fresh start" outliers.
-    """
-    def __init__(self, patience: int = 200, min_delta_ratio: float = 0.01, check_freq: int = 1, warmup_steps: int = 20, verbose: int = 1):
+    def __init__(self, patience: int = 200, min_delta_ratio: float = 0.01, check_freq: int = 1, warmup_steps: int = 20, verbose: int = 1, catastrophic_patience: int = 20):
         super().__init__(verbose)
         self.patience = patience
         self.min_delta_ratio = min_delta_ratio
         self.check_freq = check_freq
         self.warmup_steps = warmup_steps
+        
+        self.catastrophic_patience = catastrophic_patience
+        self.consecutive_timeouts = 0
         
         self.best_latency = np.inf
         self.wait_count = 0
@@ -892,16 +968,23 @@ class ConvergenceStoppingCallback(BaseCallback):
         
         # Retrieve current step latency from infos
         infos = self.locals.get("infos", [{}])[0]
-        current_step_latency = infos.get("latency", None)
+        current_step_latency = infos.get("latency_ms", getattr(env, "best_latency_ms", None))
         
-        if current_step_latency is None:
-             # Fallback to env best_latency_ms if not in infos
-             current_step_latency = getattr(env, "best_latency_ms", None)
+        is_timeout = infos.get("early_stop", False)
 
+        if is_timeout:
+            self.consecutive_timeouts += self.check_freq
+            if self.consecutive_timeouts >= self.catastrophic_patience:
+                if self.verbose > 0:
+                    print(f"\n[EarlyStop] Catastrophic! Hit {self.catastrophic_patience} consecutive timeouts.")
+                    print("[EarlyStop] The agent is trapped in a terrible parameter space. Force stopping phase.")
+                return False
+        else:
+            self.consecutive_timeouts = 0
+            
         if current_step_latency is None:
             return True
-
-        # Initialize best_latency on first check after warmup
+        
         if self.best_latency == np.inf:
             self.best_latency = current_step_latency
             if self.verbose > 0:

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+keys/
+pg_data/
+training_log/
+merge_test_log/
+__pycache__/
+*.pyc
+*.pyo
+*.zip

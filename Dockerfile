@@ -4,8 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PGDATA=/var/lib/postgresql/data
 
-# 1. Install necessary packages including PostgreSQL and development tools for dbgen
-RUN apt-get update && apt-get install -y \
+# PostgreSQL runs in the same container as the PGRL pipeline. Build tools are
+# required for TPC-H dbgen.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gcc \
     make \
@@ -13,28 +14,23 @@ RUN apt-get update && apt-get install -y \
     postgresql-client-15 \
     sudo \
     procps \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Download and compile TPC-H dbgen during the build stage
+# TPC-H data generator and PostgreSQL TPC-H primary-key/index scripts.
 WORKDIR /opt
-RUN git clone https://github.com/gregrahn/tpch-kit.git tpch-dbgen \
-    && cd tpch-dbgen/dbgen \
+RUN git clone --depth 1 https://github.com/gregrahn/tpch-kit.git tpch-dbgen \
+    && cd /opt/tpch-dbgen/dbgen \
     && make \
-    && cd /opt \
-    && git clone https://github.com/tvondra/pg_tpch.git pg_tpch
+    && git clone --depth 1 https://github.com/tvondra/pg_tpch.git /opt/pg_tpch
 
-# 3. Copy Python dependencies and code
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# 4. Copy entrypoint script
-COPY entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY src /app/src
+COPY run_all.sh /app/run_all.sh
+RUN chmod +x /app/run_all.sh \
+    && mkdir -p /app/training_log/experiment_reports /app/merge_test_log /app/reference_configs
 
-# 5. Set Entrypoint
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-
-# Default command
-CMD ["python", "src/test_ppo.py"]
+CMD ["bash", "/app/run_all.sh"]

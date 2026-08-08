@@ -1,50 +1,17 @@
-version: '3.8'
-
 services:
-  pgrl-q1:
+  pgrl:
     build: .
-    container_name: pgrl-trainer-q1
-    shm_size: 4gb
-    
+    container_name: pgrl-demo
+    shm_size: "4gb"
+    env_file:
+      - .env
     volumes:
-      # Mount log directory
+      # One persistent PostgreSQL instance is shared by every sequential
+      # training run, GCM, and final validation in this single container.
+      - pgrl_pg_data:/var/lib/postgresql/data
       - ./training_log:/app/training_log
-      # Mount Q1 specific database directory
-      - ./pg_data_q1:/var/lib/postgresql/data
-    
-    environment:
-      PGDATA: /var/lib/postgresql/data
+      - ./merge_test_log:/app/merge_test_log
+      - ./reference_configs:/app/reference_configs
 
-    # Training for Q1
-    command: >
-      python src/test_ppo.py 
-      --queries "Q1" 
-      --dsn "dbname=tpch10 user=wettin password=312552029 host=localhost port=5432" 
-      --remote-conf "/var/lib/postgresql/data/auto_tuning.conf"
-      --total-p1 2048
-      --total-p2 2048
-      --total-p3 2048
-
-  pgrl-q2:
-    build: .
-    container_name: pgrl-trainer-q2
-    shm_size: 4gb
-    
-    volumes:
-      # Mount log directory
-      - ./training_log:/app/training_log
-      # Mount Q2 specific database directory
-      - ./pg_data_q2:/var/lib/postgresql/data
-    
-    environment:
-      PGDATA: /var/lib/postgresql/data
-
-    # Training for Q2
-    command: >
-      python src/test_ppo.py 
-      --queries "Q2" 
-      --dsn "dbname=tpch10 user=wettin password=312552029 host=localhost port=5432" 
-      --remote-conf "/var/lib/postgresql/data/auto_tuning.conf"
-      --total-p1 2048
-      --total-p2 2048
-      --total-p3 2048
+volumes:
+  pgrl_pg_data:

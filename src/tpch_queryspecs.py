@@ -10,7 +10,7 @@ class QuerySpec:
 # Psycopg2-style (%s) placeholders for all parameters.
 # Default parameter values are common/canonical examples for TPC-H;
 
-Q_MAP: Dict[str, QuerySpec] = {
+SQL_MAP: Dict[str, QuerySpec] = {
     "Q1": QuerySpec(
         name="Q1",
         sql="""
@@ -779,4 +779,4 @@ Q_MAP: Dict[str, QuerySpec] = {
     ),
 }
 
-WORKLOAD = list(Q_MAP.keys())  # ['Q1','Q2',...,'Q22']
+WORKLOAD = list(SQL_MAP.keys())  # ['Q1','Q2',...,'Q22']
