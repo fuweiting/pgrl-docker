@@ -8,8 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # required for TPC-H dbgen.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    gcc \
-    make \
+    build-essential \
     postgresql-15 \
     postgresql-client-15 \
     sudo \
