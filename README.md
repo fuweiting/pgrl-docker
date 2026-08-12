@@ -1062,4 +1062,5 @@ Because `run_all.sh` exports `TARGET_DB_PASS` as `PGPASSWORD`, the password is a
 **Weiting Fu**  
 National Yang Ming Chiao Tung University  
 
-Email: rokukyuu.cs12@nycu.edu.tw
+- Email: rokukyuu.cs12@nycu.edu.tw
+- Project Repository: https://github.com/fuweiting/pgrl-docker
