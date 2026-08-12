@@ -1056,3 +1056,10 @@ Thumbs.db
 The persistent PostgreSQL data is stored in a Docker named volume (`pgrl_pg_data`) rather than in the repository and should not be committed.
 
 Because `run_all.sh` exports `TARGET_DB_PASS` as `PGPASSWORD`, the password is available inside the container environment when one is configured. Access to the host and Docker daemon should therefore remain appropriately restricted.
+
+## Author and Contact
+
+**Weiting Fu**  
+National Yang Ming Chiao Tung University  
+
+Email: rokukyuu.cs12@nycu.edu.tw
