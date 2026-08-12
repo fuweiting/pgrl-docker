@@ -23,7 +23,7 @@ echo "========================================="
 # -----------------------------------------------------------------------------
 PG_DATA="${PGDATA:-/var/lib/postgresql/data}"
 DB_NAME="${TARGET_DB_NAME:-tpch10}"
-DB_USER="${TARGET_DB_USER:-wettin}"
+DB_USER="${TARGET_DB_USER:-pgrl}"
 DB_PASS="${TARGET_DB_PASS:-}"
 DB_PORT="${TARGET_DB_PORT:-5432}"
 TUNING_CONF="${REMOTE_CONF_PATH:-${PG_DATA}/auto_tuning.conf}"
